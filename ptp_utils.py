@@ -62,7 +62,7 @@ def view_images(images, num_rows=1, offset_ratio=0.02):
 
 
 def diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource=False):
-    if low_resource:
+    if low_resource: # whether GPU memory large enough, same results as abundant resources 
         noise_pred_uncond = model.unet(latents, t, encoder_hidden_states=context[0])["sample"]
         noise_prediction_text = model.unet(latents, t, encoder_hidden_states=context[1])["sample"]
     else:
@@ -160,7 +160,8 @@ def text2image_ldm_stable(
     latent, latents = init_latent(latent, model, height, width, generator, batch_size)
     
     # set timesteps
-    extra_set_kwargs = {"offset": 1}
+    # extra_set_kwargs = {"offset": 1}
+    extra_set_kwargs = {}
     model.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
     for t in tqdm(model.scheduler.timesteps):
         latents = diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource)
@@ -169,40 +170,60 @@ def text2image_ldm_stable(
   
     return image, latent
 
+def reshape_heads_to_batch_dim(tensor, head_size):
+        batch_size, seq_len, dim = tensor.shape
+        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
+        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+        return tensor
+
+# https://github.com/huggingface/diffusers/blob/716286f19ddd9eb417113e064b538706884c8e73/src/diffusers/models/cross_attention.py#L34
+def reshape_batch_dim_to_heads(tensor, head_size):
+        batch_size, seq_len, dim = tensor.shape
+        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
+        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
+        return tensor
 
 def register_attention_control(model, controller):
     def ca_forward(self, place_in_unet):
-        to_out = self.to_out
-        if type(to_out) is torch.nn.modules.container.ModuleList:
-            to_out = self.to_out[0]
-        else:
-            to_out = self.to_out
 
-        def forward(x, context=None, mask=None):
+        # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py#L36
+        def forward(hidden_states, encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
+            to_out = self.to_out
+            if type(to_out) is torch.nn.modules.container.ModuleList:
+                to_out = self.to_out[0]
+            else:
+                to_out = self.to_out
+
+            x = hidden_states.clone()
             batch_size, sequence_length, dim = x.shape
             h = self.heads
             q = self.to_q(x)
-            is_cross = context is not None
-            context = context if is_cross else x
+            if encoder_hidden_states is not None:
+                is_cross = True
+            else:
+                is_cross = False
+            context = encoder_hidden_states if is_cross else x
             k = self.to_k(context)
             v = self.to_v(context)
-            q = self.reshape_heads_to_batch_dim(q)
-            k = self.reshape_heads_to_batch_dim(k)
-            v = self.reshape_heads_to_batch_dim(v)
+            head_size = self.heads
+            q = reshape_heads_to_batch_dim(q, head_size)
+            k = reshape_heads_to_batch_dim(k, head_size)
+            v = reshape_heads_to_batch_dim(v, head_size)
 
             sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
 
-            if mask is not None:
-                mask = mask.reshape(batch_size, -1)
+            attention_mask1 = attention_mask.clone() if attention_mask is not None else None
+            if attention_mask1 is not None:
+                attention_mask1 = attention_mask1.reshape(batch_size, -1)
                 max_neg_value = -torch.finfo(sim.dtype).max
-                mask = mask[:, None, :].repeat(h, 1, 1)
-                sim.masked_fill_(~mask, max_neg_value)
+                attention_mask1 = attention_mask1[:, None, :].repeat(h, 1, 1)
+                sim.masked_fill_(~attention_mask1, max_neg_value)
 
             # attention, what we cannot get enough of
             attn = sim.softmax(dim=-1)
-            attn = controller(attn, is_cross, place_in_unet)
+            attn = controller(attn, is_cross, place_in_unet) # all this is for this line: store the attention map into controller, and manipulate the attention map
             out = torch.einsum("b i j, b j d -> b i d", attn, v)
-            out = self.reshape_batch_dim_to_heads(out)
+            out = reshape_batch_dim_to_heads(out, head_size)
             return to_out(out)
 
         return forward
@@ -218,18 +239,38 @@ def register_attention_control(model, controller):
     if controller is None:
         controller = DummyController()
 
-    def register_recr(net_, count, place_in_unet):
-        if net_.__class__.__name__ == 'CrossAttention':
-            net_.forward = ca_forward(net_, place_in_unet)
-            return count + 1
-        elif hasattr(net_, 'children'):
-            for net__ in net_.children():
-                count = register_recr(net__, count, place_in_unet)
+    def register_recr(net_, count, place_in_unet, is_cross=True):
+        # print(place_in_unet, ' ', net_.__class__.__name__)
+
+        if is_cross:
+            if hasattr(net_, 'attn2'):
+                # print('net_ name:', net_.__class__.__name__)
+                crossattentionlayer = net_.get_submodule('attn2')
+                # print('crossattention_name:', crossattentionlayer.__class__.__name__)
+                crossattentionlayer.forward = ca_forward(crossattentionlayer, place_in_unet)
+                return count + 1
+            elif hasattr(net_, 'children'):
+                for net__ in net_.children():
+                    count = register_recr(net__, count, place_in_unet, is_cross=True)
+        else:
+            if hasattr(net_, 'attn1'):
+                # print('net_ name:', net_.__class__.__name__)
+                crossattentionlayer = net_.get_submodule('attn1')
+                # print('crossattention_name:', crossattentionlayer.__class__.__name__)
+                crossattentionlayer.forward = ca_forward(crossattentionlayer, place_in_unet)
+                return count + 1
+            elif hasattr(net_, 'children'):
+                for net__ in net_.children():
+                    count = register_recr(net__, count, place_in_unet, is_cross=False)
+
+
         return count
 
+    # register cross attention
     cross_att_count = 0
     sub_nets = model.unet.named_children()
     for net in sub_nets:
+        # print(net[0])
         if "down" in net[0]:
             cross_att_count += register_recr(net[1], 0, "down")
         elif "up" in net[0]:
@@ -238,6 +279,20 @@ def register_attention_control(model, controller):
             cross_att_count += register_recr(net[1], 0, "mid")
 
     controller.num_att_layers = cross_att_count
+
+    # register self attention
+    self_att_count = 0
+    sub_nets = model.unet.named_children()
+    for net in sub_nets:
+        # print(net[0])
+        if "down" in net[0]:
+            self_att_count += register_recr(net[1], 0, "down", is_cross=False)
+        elif "up" in net[0]:
+            self_att_count += register_recr(net[1], 0, "up", is_cross=False)
+        elif "mid" in net[0]:
+            self_att_count += register_recr(net[1], 0, "mid", is_cross=False)
+
+    controller.num_att_layers += self_att_count
 
     
 def get_word_inds(text: str, word_place: int, tokenizer):
