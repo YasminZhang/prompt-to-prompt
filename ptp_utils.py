@@ -34,7 +34,7 @@ def text_under_image(image: np.ndarray, text: str, text_color: Tuple[int, int, i
     return img
 
 
-def view_images(images, num_rows=1, offset_ratio=0.02):
+def view_images(images, num_rows=1, offset_ratio=0.02, save_path=None):
     if type(images) is list:
         num_empty = len(images) % num_rows
     elif images.ndim == 4:
@@ -58,6 +58,8 @@ def view_images(images, num_rows=1, offset_ratio=0.02):
                 i * num_cols + j]
 
     pil_img = Image.fromarray(image_)
+    if save_path is not None:
+        pil_img.save(save_path)
     display(pil_img)
 
 
@@ -87,10 +89,10 @@ def latent2image(vae, latents):
 def init_latent(latent, model, height, width, generator, batch_size):
     if latent is None:
         latent = torch.randn(
-            (1, model.unet.in_channels, height // 8, width // 8),
+            (1, model.unet.config.in_channels, height // 8, width // 8),
             generator=generator,
         )
-    latents = latent.expand(batch_size,  model.unet.in_channels, height // 8, width // 8).to(model.device)
+    latents = latent.expand(batch_size,  model.unet.config.in_channels, height // 8, width // 8).to(model.device)
     return latent, latents
 
 
